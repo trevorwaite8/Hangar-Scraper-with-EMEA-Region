@@ -489,11 +489,49 @@ def parse_google_date(raw: str) -> str:
     return ""
 
 
+def _date_sort_desc_key(date_str: str) -> tuple:
+    """
+    Build a sort key that makes dates sort DESCENDING (newest first) inside
+    an ascending sort. Also ranks exact dates above approximate ("~2026-07-06")
+    dates for the same day, and pushes empty dates to the bottom.
+
+    Returns a tuple that ascending-sorts correctly.
+    """
+    if not date_str:
+        # Empty date sorts last (highest tuple value in ascending sort)
+        return (2, "")
+
+    if date_str.startswith("~"):
+        # Approximate date — same day rank as exact, but tiebreaker sends it
+        # BELOW the exact date. We invert the date string so newer sorts first.
+        clean = date_str[1:]
+        return (1, _invert_date_string(clean))
+
+    # Exact date
+    return (0, _invert_date_string(date_str))
+
+
+def _invert_date_string(s: str) -> str:
+    """
+    Invert a YYYY-MM-DD string so that ascending sort puts newer dates first.
+    Trick: subtract each digit from 9. "2026-07-06" -> "7973-92-93". Simple
+    and no need for datetime parsing.
+    """
+    return "".join(str(9 - int(c)) if c.isdigit() else c for c in s)
+
+
 def enrich_with_page_data(rows: list[dict]) -> list[dict]:
     """
     Visit each article URL and overwrite date/location with
     accurate values extracted directly from the page.
+
+    If no date can be extracted for a news article, fall back to today's
+    date prefixed with "~" (e.g. "~2026-07-06") so the row sorts sensibly
+    with other recent finds instead of dropping to the bottom with a blank
+    date. The tilde flags the value as approximate — it reflects when we
+    discovered the article, not when it was published.
     """
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
     for i, row in enumerate(rows):
         url = row.get("Source URL", "")
         if not url or row.get("Source") == "sam_gov":
@@ -505,6 +543,15 @@ def enrich_with_page_data(rows: list[dict]) -> list[dict]:
         if meta.get("location"):
             row["Location"] = meta["location"]
         time.sleep(0.5)   # be polite
+
+    # After enrichment: any news row still missing a date gets today's date
+    # with the ~ approximate marker. SAM.gov / procurement rows are left
+    # alone since their dates are always reliable from the source.
+    for row in rows:
+        if row.get("Source") == "sam_gov":
+            continue
+        if not row.get("Date Published"):
+            row["Date Published"] = "~" + today_str
     return rows
 
 
@@ -1454,9 +1501,41 @@ def main():
     na_rows, emea_rows = split_by_region(all_rows)
     log.info("After location split — NA: %d | EMEA: %d", len(na_rows), len(emea_rows))
 
-    # 10. Sort by date
-    na_rows.sort(key=lambda r: r.get("Date Published", ""), reverse=True)
-    emea_rows.sort(key=lambda r: r.get("Date Published", ""), reverse=True)
+    # 10. Sort by source type, then by date descending.
+    #
+    # Rationale: SAM.gov posts always have reliable dates, while news articles
+    # sometimes don't (some sites hide publish dates). A single date-desc sort
+    # buries every dateless news article at the bottom, making the report look
+    # like it only found SAM.gov posts. By sorting on source FIRST, news
+    # articles rise to the top where they belong. Within each source group,
+    # rows are ordered by date descending, so the freshest news is on top.
+    #
+    # Source priority (0 = highest, appears first):
+    #   0 = news (Google-indexed articles — the primary intelligence value)
+    #   1 = ted_europa (European procurement)
+    #   2 = canadabuys (Canadian procurement)
+    #   3 = austender (Australian procurement)
+    #   4 = sam_gov (US procurement — supplementary reference)
+    SOURCE_PRIORITY = {
+        "news":         0,
+        "ted_europa":   1,
+        "canadabuys":   2,
+        "austender":    3,
+        "sam_gov":      4,
+    }
+
+    def sort_key(r: dict) -> tuple:
+        src   = r.get("Source", "")
+        date  = r.get("Date Published", "") or ""
+        # Priority ascending (0 first), date descending. Reverse-sort the
+        # priority by negating below? No — instead build the key so that
+        # standard ascending sort produces the desired order: low priority
+        # number first, then newest date first (by inverting date via a
+        # placeholder that sorts inversely).
+        return (SOURCE_PRIORITY.get(src, 99), _date_sort_desc_key(date))
+
+    na_rows.sort(key=sort_key)
+    emea_rows.sort(key=sort_key)
 
     total = len(na_rows) + len(emea_rows)
     log.info("Total unique results: %d (NA: %d, EMEA: %d)", total, len(na_rows), len(emea_rows))
