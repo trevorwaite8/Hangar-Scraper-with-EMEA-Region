@@ -7,6 +7,36 @@ AusTender, and TED Europa. Emails a formatted Excel report with two tabs
 (North America and EMEA) to the Safespill team every Monday at 8am PST.
 
 Setup: see README.md
+
+------------------------------------------------------------------------------
+CREDENTIAL ROTATION SCHEDULE
+------------------------------------------------------------------------------
+Some of the credentials this scraper uses expire on a schedule. When one
+rotates, the scraper will start failing on that data source until the new
+value is pasted into the corresponding GitHub secret.
+
+  SAM_API_KEY       Rotates every 90 days. SAM.gov auto-generates the new
+                    key ~10 days before the old one expires and emails
+                    a reminder. Retrieve it at:
+                        https://sam.gov/workspace/profile/account-details
+                    (Public API Key section → click the eye icon → enter
+                    the one-time password sent to your email → copy the
+                    revealed key.) Then update GitHub → Settings →
+                    Secrets and variables → Actions → SAM_API_KEY.
+
+  SMTP_PASSWORD     Gmail App Password. Doesn't expire on a schedule,
+                    but is invalidated if the account password changes
+                    or 2FA is reset. Regenerate at:
+                        https://myaccount.google.com/apppasswords
+
+  SERPAPI_KEY       Doesn't expire, but check quota at:
+                        https://serpapi.com/dashboard
+
+  AUSTENDER_TOKEN   Optional. Registration pending at tenders.gov.au.
+
+If the weekly run log shows repeated failures from a single source
+(e.g. every SAM.gov call returns 401/403), a rotated / stale credential
+is the most likely cause. Check the corresponding renewal step above.
 """
 
 import os
@@ -583,6 +613,10 @@ def samgov_search(start_date: str, end_date: str) -> list[dict]:
 
     for keyword in sam_keywords:
         params = {
+            # SAM_API_KEY rotates every 90 days. If SAM.gov calls suddenly
+            # return 401/403 errors, the key has likely expired — see the
+            # credential rotation section at the top of this file for how
+            # to retrieve the new one from sam.gov/workspace/profile.
             "api_key":    os.environ.get("SAM_API_KEY", "DEMO_KEY"),
             "postedFrom": fmt(start_date),
             "postedTo":   fmt(end_date),
