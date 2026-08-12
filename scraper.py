@@ -105,7 +105,31 @@ log = logging.getLogger(__name__)
 # impossible to import for testing without the full production environment.
 
 def env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default)
+    """
+    Read an environment variable, treating an EMPTY value as absent.
+
+    This matters on GitHub Actions: a workflow_dispatch input that is not
+    supplied (e.g. on a scheduled run) expands to an empty string rather than
+    being unset. Plain os.environ.get would return "" and int("") raises.
+    """
+    val = os.environ.get(name, "")
+    return val.strip() if val.strip() else default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(env(name, str(default)))
+    except (TypeError, ValueError):
+        log.warning("%s is not a valid integer (%r) — using %d",
+                    name, os.environ.get(name), default)
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    val = env(name, "").lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on", "y")
 
 
 # How far back news results may be dated. Rows outside this window are dropped.
@@ -119,7 +143,7 @@ HISTORY_RETENTION_DAYS = 365        # rolling 12 months
 
 # SerpAPI budget. Free tier is 250 searches/month; at ~4.33 weekly runs per
 # month, 40/run = ~174/month and leaves room for manual test runs.
-SEARCH_BUDGET_PER_RUN = int(env("SEARCH_BUDGET_PER_RUN", "40"))
+SEARCH_BUDGET_PER_RUN = env_int("SEARCH_BUDGET_PER_RUN", 40)
 
 # Target volume of NEW rows per week. Used to auto-tighten the relevance
 # threshold when a week over-delivers.
@@ -303,7 +327,7 @@ AVIATION_ANCHORS = (
     "helicopter", "jet ", "airline", "air force", "naval air",
 )
 
-MIN_RELEVANCE_SCORE = int(env("MIN_RELEVANCE_SCORE", "12"))
+MIN_RELEVANCE_SCORE = env_int("MIN_RELEVANCE_SCORE", 12)
 
 
 def normalise_url(url: str) -> str:
@@ -2720,7 +2744,7 @@ def send_email_smtp(xlsx: bytes, filename: str, subject: str, body: str) -> None
     msg.attach(part)
 
     with smtplib.SMTP(env("SMTP_HOST", "smtp.gmail.com"),
-                      int(env("SMTP_PORT", "587"))) as server:
+                      env_int("SMTP_PORT", 587)) as server:
         server.ehlo()
         server.starttls()
         server.login(user, env("SMTP_PASSWORD"))
@@ -2729,6 +2753,18 @@ def send_email_smtp(xlsx: bytes, filename: str, subject: str, body: str) -> None
 
 
 def send_report(xlsx: bytes, filename: str, subject: str, body: str) -> None:
+    # DRY_RUN builds the whole report and writes the workbook to disk but sends
+    # nothing, so a run can be inspected without emailing anyone.
+    if env_bool("DRY_RUN"):
+        log.info("=" * 70)
+        log.info("DRY RUN — no email sent. The report was built successfully.")
+        log.info("Would have sent %r to: %s", subject, ", ".join(recipients()))
+        log.info("Attachment: %s (%.1f KB)", filename, len(xlsx) / 1024)
+        log.info("Download the workbook from this run's Artifacts section.")
+        log.info("Email body follows:\n%s", body)
+        log.info("=" * 70)
+        return
+
     if graph_configured():
         try:
             send_email_graph(xlsx, filename, subject, body)
@@ -2853,6 +2889,12 @@ def main() -> None:
     run_date = today().isoformat()
     week = week_label()
     log.info("=== Safespill Hangar Report run %s (week of %s) ===", run_date, week)
+    if env_bool("TEST_MODE"):
+        log.warning("TEST MODE: history will NOT be saved.")
+    if env_bool("DRY_RUN"):
+        log.warning("DRY RUN: no email will be sent.")
+    log.info("Search budget this run: %d | minimum relevance score: %d",
+             SEARCH_BUDGET_PER_RUN, MIN_RELEVANCE_SCORE)
 
     starting_quota = check_serpapi_quota()
     log_quota_status("Start", starting_quota)
@@ -2890,9 +2932,17 @@ def main() -> None:
     # 7. Trim to the weekly target
     rows = trim_to_target(rows)
 
-    # 8. Merge into cumulative history
+    # 8. Merge into cumulative history.
+    #    TEST_MODE skips the write entirely. Without this a test run would
+    #    record every article it found as "already seen", and the next real
+    #    report would come back nearly empty.
     merged, fresh = merge_history(history, rows, run_date)
-    save_history(merged)
+    if env_bool("TEST_MODE"):
+        log.warning("TEST_MODE — not writing %s. This run's %d new rows stay "
+                    "unseen, so the next scheduled report will still pick "
+                    "them up.", HISTORY_FILE, len(fresh))
+    else:
+        save_history(merged)
 
     # 9. Split into tabs and build the workbook
     buckets = split_by_region(merged)
@@ -2902,6 +2952,16 @@ def main() -> None:
     wb = build_workbook(buckets, run_date)
     xlsx = workbook_to_bytes(wb)
     filename = f"Safespill_Hangar_Report_{week}.xlsx"
+
+    # Write the workbook next to the script so the workflow can upload it as a
+    # build artifact. Means a test run (or a failed send) still leaves a
+    # downloadable copy of the spreadsheet.
+    try:
+        with open(filename, "wb") as fh:
+            fh.write(xlsx)
+        log.info("Wrote %s (%.1f KB) to the workspace", filename, len(xlsx) / 1024)
+    except Exception as exc:
+        log.warning("Could not write %s to disk: %s", filename, exc)
 
     # 10. Email
     ending_quota = check_serpapi_quota()
