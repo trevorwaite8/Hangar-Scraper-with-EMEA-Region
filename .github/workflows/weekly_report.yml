@@ -3,19 +3,40 @@ name: Safespill Weekly Hangar Report
 on:
   # Mondays at 8:00 AM Pacific.
   # NOTE: GitHub cron is always UTC and does NOT follow daylight saving.
-  #   PDT (Mar-Nov, UTC-7)  -> 15:00 UTC
-  #   PST (Nov-Mar, UTC-8)  -> 16:00 UTC
-  # Both are listed so the report lands at 8am or 9am year-round rather than
-  # silently drifting an hour. Delete whichever you prefer if one run a week
-  # is enough and an hour of drift does not matter.
+  #   PDT (Mar-Nov, UTC-7)  -> 15:00 UTC = 8am local
+  #   PST (Nov-Mar, UTC-8)  -> 15:00 UTC = 7am local
+  # One cron cannot hit 8am year-round. Change to "0 16 * * 1" if you would
+  # rather the winter months be exact and summer arrive at 9am.
   schedule:
     - cron: "0 15 * * 1"
 
-  # Manual trigger from the Actions tab
+  # Manual trigger from the Actions tab.
+  #
+  # The defaults below are deliberately SAFE for a test: a manual run emails
+  # only the test recipient, spends 5 SerpAPI searches instead of 40, and does
+  # not write history.csv. To fire a genuine full report by hand, untick
+  # test_mode and clear the search_budget field.
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Test run: email only the test recipient and do NOT save history"
+        type: boolean
+        default: true
+      test_recipient:
+        description: "Who receives the test email"
+        type: string
+        default: "trevorw@safespill.com"
+      search_budget:
+        description: "SerpAPI searches to spend (blank = 40). 5 is a cheap smoke test."
+        type: string
+        default: "5"
+      dry_run:
+        description: "Build the report but send NO email at all (download from Artifacts)"
+        type: boolean
+        default: false
 
-# Required so the job can commit history.csv back to the repo. Without this
-# the report would lose its memory every week and re-send the same articles.
+# Required so the job can commit history.csv back to the repo. Without this the
+# report would lose its memory every week and re-send the same articles.
 permissions:
   contents: write
 
@@ -43,6 +64,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Show run mode
+        run: |
+          if [ "${{ inputs.test_mode }}" = "true" ]; then
+            echo "::warning::TEST RUN — email goes only to ${{ inputs.test_recipient }} and history.csv will NOT be updated."
+          else
+            echo "Full run: emailing the REPORT_RECIPIENT list and saving history."
+          fi
+
       - name: Run scraper and send report
         env:
           # --- Search ---
@@ -50,33 +79,41 @@ jobs:
           SAM_API_KEY:         ${{ secrets.SAM_API_KEY }}
 
           # --- Email: SMTP (active) ---
-          # Currently sending from the Gmail account, unchanged from v1.
           SMTP_USER:           ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD:       ${{ secrets.SMTP_PASSWORD }}
 
           # --- Email: Microsoft Graph (not configured yet — deferred) ---
-          # These four resolve to empty strings while the secrets do not
-          # exist, and the scraper falls back to SMTP above. Left in place
-          # deliberately: when you are ready to send from a safespill.com
-          # address, add the four GRAPH_* secrets and the next run switches
-          # over on its own. No edit to this file or to scraper.py needed.
-          # See SETUP.md section 3 for what IT has to do.
+          # These resolve to empty strings while the secrets do not exist, and
+          # the scraper falls back to SMTP above. Left in place deliberately:
+          # when you are ready to send from a safespill.com address, add the
+          # four GRAPH_* secrets and the next run switches over on its own.
+          # No edit to this file or to scraper.py needed. See SETUP.md § 3.
           GRAPH_TENANT_ID:     ${{ secrets.GRAPH_TENANT_ID }}
           GRAPH_CLIENT_ID:     ${{ secrets.GRAPH_CLIENT_ID }}
           GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
           GRAPH_SENDER:        ${{ secrets.GRAPH_SENDER }}
 
           # --- Recipients ---
-          # Read from the REPORT_RECIPIENT repository secret so the list can be
-          # changed without editing this file. Kyle Giubbini
-          # (kyleg@safespill.com) removed per CEO request, 2026-08-12.
-          REPORT_RECIPIENT:    ${{ secrets.REPORT_RECIPIENT }}
+          # A test run is redirected to the single test address. Any other run
+          # (including every scheduled one) uses the REPORT_RECIPIENT secret.
+          # Kyle Giubbini removed from that secret per CEO request 2026-08-12.
+          REPORT_RECIPIENT: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.test_mode)
+                && inputs.test_recipient
+                || secrets.REPORT_RECIPIENT }}
+
+          # --- Run mode ---
+          # Empty on scheduled runs, which the scraper reads as "use default".
+          TEST_MODE:             ${{ inputs.test_mode }}
+          DRY_RUN:               ${{ inputs.dry_run }}
+          SEARCH_BUDGET_PER_RUN: ${{ inputs.search_budget }}
         run: python scraper.py
 
       - name: Commit updated history
-        # Runs even if the email step failed, so a send failure does not also
-        # throw away the week's collected rows.
-        if: always()
+        # Skipped on test runs. A test run that committed history.csv would mark
+        # everything it found as already seen, and the next real report would
+        # come back nearly empty.
+        if: always() && !(github.event_name == 'workflow_dispatch' && inputs.test_mode)
         run: |
           if [ -n "$(git status --porcelain history.csv)" ]; then
             git config user.name  "safespill-report-bot"
@@ -89,13 +126,14 @@ jobs:
           fi
 
       - name: Upload report artifact
-        # A copy of the workbook is kept on the Actions run for 90 days, so a
-        # failed email does not mean the week's findings are lost.
+        # The workbook and history are kept on the run for 90 days, so a test
+        # run or a failed email still leaves a downloadable spreadsheet.
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hangar-report
+          name: hangar-report-${{ github.run_number }}
           path: |
+            Safespill_Hangar_Report_*.xlsx
             history.csv
           retention-days: 90
           if-no-files-found: warn
