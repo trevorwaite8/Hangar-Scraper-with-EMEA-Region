@@ -1,26 +1,101 @@
 name: Safespill Weekly Hangar Report
 
 on:
+  # Mondays at 8:00 AM Pacific.
+  # NOTE: GitHub cron is always UTC and does NOT follow daylight saving.
+  #   PDT (Mar-Nov, UTC-7)  -> 15:00 UTC
+  #   PST (Nov-Mar, UTC-8)  -> 16:00 UTC
+  # Both are listed so the report lands at 8am or 9am year-round rather than
+  # silently drifting an hour. Delete whichever you prefer if one run a week
+  # is enough and an hour of drift does not matter.
   schedule:
-    - cron: '0 16 * * 1'   # Every Monday at 8am PST (16:00 UTC)
-  workflow_dispatch:         # Also allows manual trigger
+    - cron: "0 15 * * 1"
+
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Required so the job can commit history.csv back to the repo. Without this
+# the report would lose its memory every week and re-send the same articles.
+permissions:
+  contents: write
+
+# Never let two runs overlap — a second run would double-spend SerpAPI quota
+# and could clobber history.csv.
+concurrency:
+  group: hangar-report
+  cancel-in-progress: false
 
 jobs:
   run-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run scraper and send report
         env:
-          SERPAPI_KEY:        ${{ secrets.SERPAPI_KEY }}
-          SAM_API_KEY:        ${{ secrets.SAM_API_KEY }}
-          SMTP_USER:          ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD:      ${{ secrets.SMTP_PASSWORD }}
-          REPORT_RECIPIENT:   ${{ secrets.REPORT_RECIPIENT }}
-          AUSTENDER_TOKEN:    ${{ secrets.AUSTENDER_TOKEN }}
+          # --- Search ---
+          SERPAPI_KEY:         ${{ secrets.SERPAPI_KEY }}
+          SAM_API_KEY:         ${{ secrets.SAM_API_KEY }}
+
+          # --- Email: SMTP (active) ---
+          # Currently sending from the Gmail account, unchanged from v1.
+          SMTP_USER:           ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:       ${{ secrets.SMTP_PASSWORD }}
+
+          # --- Email: Microsoft Graph (not configured yet — deferred) ---
+          # These four resolve to empty strings while the secrets do not
+          # exist, and the scraper falls back to SMTP above. Left in place
+          # deliberately: when you are ready to send from a safespill.com
+          # address, add the four GRAPH_* secrets and the next run switches
+          # over on its own. No edit to this file or to scraper.py needed.
+          # See SETUP.md section 3 for what IT has to do.
+          GRAPH_TENANT_ID:     ${{ secrets.GRAPH_TENANT_ID }}
+          GRAPH_CLIENT_ID:     ${{ secrets.GRAPH_CLIENT_ID }}
+          GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
+          GRAPH_SENDER:        ${{ secrets.GRAPH_SENDER }}
+
+          # --- Recipients ---
+          # Read from the REPORT_RECIPIENT repository secret so the list can be
+          # changed without editing this file. Kyle Giubbini
+          # (kyleg@safespill.com) removed per CEO request, 2026-08-12.
+          REPORT_RECIPIENT:    ${{ secrets.REPORT_RECIPIENT }}
         run: python scraper.py
+
+      - name: Commit updated history
+        # Runs even if the email step failed, so a send failure does not also
+        # throw away the week's collected rows.
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain history.csv)" ]; then
+            git config user.name  "safespill-report-bot"
+            git config user.email "actions@github.com"
+            git add history.csv
+            git commit -m "Update hangar report history for $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "history.csv unchanged — nothing to commit."
+          fi
+
+      - name: Upload report artifact
+        # A copy of the workbook is kept on the Actions run for 90 days, so a
+        # failed email does not mean the week's findings are lost.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hangar-report
+          path: |
+            history.csv
+          retention-days: 90
+          if-no-files-found: warn
