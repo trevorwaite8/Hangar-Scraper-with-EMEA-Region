@@ -104,10 +104,24 @@ jobs:
           REPORT_RECIPIENT: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_mode) && inputs.test_recipient || secrets.REPORT_RECIPIENT }}
 
           # --- Run mode ---
-          # Empty on scheduled runs, which the scraper reads as "use default".
+          # TEST_MODE and DRY_RUN are empty on scheduled runs, which the
+          # scraper reads as "use the default" (i.e. false).
           TEST_MODE:             ${{ inputs.test_mode }}
           DRY_RUN:               ${{ inputs.dry_run }}
-          SEARCH_BUDGET_PER_RUN: ${{ inputs.search_budget }}
+
+          # This is the CEILING, not the amount spent. The scraper reads its
+          # live SerpAPI quota at the start of every run (a free call) and
+          # lowers its own budget when the allowance is running short, dividing
+          # what is left across the runs remaining before the plan renews. So
+          # there is nothing to set here and nothing to remember to reset —
+          # quota management is automatic.
+          #
+          # Resolution order: manual-run input, then the optional
+          # SEARCH_BUDGET repository variable, then the built-in default of 40.
+          # The variable is only an escape hatch for permanently raising or
+          # lowering the ceiling (e.g. after upgrading the SerpAPI plan). Under
+          # normal operation, leave it unset.
+          SEARCH_BUDGET_PER_RUN: ${{ inputs.search_budget || vars.SEARCH_BUDGET }}
         run: python scraper.py
 
       - name: Commit updated history
