@@ -97,10 +97,11 @@ jobs:
           # A test run is redirected to the single test address. Any other run
           # (including every scheduled one) uses the REPORT_RECIPIENT secret.
           # Kyle Giubbini removed from that secret per CEO request 2026-08-12.
-          REPORT_RECIPIENT: >-
-            ${{ (github.event_name == 'workflow_dispatch' && inputs.test_mode)
-                && inputs.test_recipient
-                || secrets.REPORT_RECIPIENT }}
+          # Kept on ONE line deliberately. Splitting it across a folded ">-"
+          # scalar leaves literal newlines inside the ${{ }} expression,
+          # because YAML preserves newlines on more-indented continuation
+          # lines. Do not reformat this for width.
+          REPORT_RECIPIENT: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_mode) && inputs.test_recipient || secrets.REPORT_RECIPIENT }}
 
           # --- Run mode ---
           # Empty on scheduled runs, which the scraper reads as "use default".
