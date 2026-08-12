@@ -227,18 +227,137 @@ ROTATING_QUERIES = [
 ]
 
 
-def queries_for_this_week(week_iso: int) -> list[str]:
+def queries_for_this_week(week_iso: int, budget: int | None = None) -> list[str]:
     """
-    Build this run's query list: all CORE_QUERIES plus a rotating slice of
-    ROTATING_QUERIES, capped at SEARCH_BUDGET_PER_RUN.
+    Build this run's query list: CORE_QUERIES first, then a rotating slice of
+    ROTATING_QUERIES, capped at `budget` (defaults to SEARCH_BUDGET_PER_RUN).
+
+    When the budget is tighter than the core list, the core list is truncated.
+    CORE_QUERIES is therefore ordered most-valuable-first, so a lean week keeps
+    the queries that matter (new construction, then fire protection) and drops
+    the speculative ones.
     """
-    slots = max(0, SEARCH_BUDGET_PER_RUN - len(CORE_QUERIES))
+    if budget is None:
+        budget = SEARCH_BUDGET_PER_RUN
+    budget = max(0, int(budget))
+    slots = max(0, budget - len(CORE_QUERIES))
     if not ROTATING_QUERIES or slots == 0:
-        return list(CORE_QUERIES)[:SEARCH_BUDGET_PER_RUN]
+        return list(CORE_QUERIES)[:budget]
     start = (week_iso * slots) % len(ROTATING_QUERIES)
     rotating = [ROTATING_QUERIES[(start + i) % len(ROTATING_QUERIES)]
                 for i in range(min(slots, len(ROTATING_QUERIES)))]
-    return list(CORE_QUERIES) + rotating
+    return (list(CORE_QUERIES) + rotating)[:budget]
+
+
+# --- Automatic quota throttling ----------------------------------------------
+#
+# The SerpAPI free tier is 250 searches per billing cycle, and that cycle does
+# NOT necessarily start on the 1st — it renews on the anniversary of signup.
+# Rather than ask anyone to track that date and remember to reset a setting,
+# the scraper works it out for itself from the /account.json response, which is
+# free to call and already fetched at the start of every run.
+#
+# Two mechanisms, in order of preference:
+#
+#   1. If the response includes plan_renewal_date, divide the remaining
+#      searches evenly across this run plus every scheduled run before renewal.
+#      Exactly the right answer, whenever the cycle happens to end.
+#
+#   2. If that field is missing or unparseable, fall back to "never spend more
+#      than half of what is left". That tapers instead of hitting zero: 61 left
+#      spends 30, then 15, then 8. Quota is never fully exhausted and no run
+#      ever dies from a 429.
+#
+# When quota is healthy both mechanisms are no-ops and the full budget is used.
+
+QUOTA_RESERVE = 5          # searches held back for manual testing
+MIN_NEWS_BUDGET = 4        # below this, skip news and run only the free feeds
+
+
+def runs_until_renewal(renewal_raw: str) -> int | None:
+    """
+    How many weekly runs remain in this billing cycle, counting THIS one.
+    Returns None if the renewal date cannot be determined.
+    """
+    renewal = parse_any_date(renewal_raw or "")
+    if not renewal:
+        return None
+    try:
+        renewal_date = datetime.date.fromisoformat(renewal)
+    except ValueError:
+        return None
+    t = today()
+    if renewal_date <= t:
+        return None                     # renews today or already stale
+    # Scheduled runs are Mondays. Count the ones between now and renewal.
+    future_runs = 0
+    d = t + datetime.timedelta(days=1)
+    while d < renewal_date:
+        if d.weekday() == 0:
+            future_runs += 1
+        d += datetime.timedelta(days=1)
+    return future_runs + 1              # + this run
+
+
+def effective_search_budget(quota: dict, configured: int) -> int:
+    """
+    Decide how many SerpAPI searches this run may spend.
+    Never raises; on any uncertainty it returns the configured budget.
+    """
+    if not quota:
+        log.warning("Could not read SerpAPI quota — using the configured "
+                    "budget of %d searches.", configured)
+        return configured
+
+    try:
+        left = int(quota.get("total_searches_left"))
+    except (TypeError, ValueError):
+        log.warning("SerpAPI quota response had no usable total_searches_left "
+                    "— using the configured budget of %d.", configured)
+        return configured
+
+    spendable = max(0, left - QUOTA_RESERVE)
+    runs_left = runs_until_renewal(quota.get("plan_renewal_date") or "")
+
+    if runs_left and runs_left >= 1:
+        # Divide what is left across this run and every remaining run in the
+        # cycle. When runs_left == 1 this is the last run before renewal, so
+        # cap == spendable: unused searches expire, there is nothing to save
+        # them for.
+        cap = spendable // runs_left
+        basis = (f"{left} searches left, {runs_left} run(s) before renewal on "
+                 f"{parse_any_date(quota.get('plan_renewal_date') or '')} "
+                 f"-> {cap}/run")
+    else:
+        cap = min(spendable, left // 2)
+        basis = (f"{left} searches left, renewal date unknown -> spending at "
+                 f"most half, {cap}")
+
+    if spendable < MIN_NEWS_BUDGET:
+        budget = 0
+    else:
+        # Floor the budget at MIN_NEWS_BUDGET rather than rounding down to
+        # zero. Spreading 15 searches over 4 runs gives 3 each, which the
+        # MIN_NEWS_BUDGET check would otherwise turn into four weeks of no
+        # news at all while 15 searches sat unused. A few lean runs beat
+        # several empty ones, and the budget is recomputed every week anyway.
+        budget = min(configured, spendable, max(cap, MIN_NEWS_BUDGET))
+
+    if budget >= configured:
+        log.info("SerpAPI budget: %d searches (quota healthy; %d left).",
+                 budget, left)
+    elif budget >= MIN_NEWS_BUDGET:
+        log.warning("SerpAPI budget REDUCED to %d searches (configured %d). "
+                    "%s. This is automatic — no action needed; it returns to "
+                    "normal when the quota renews.", budget, configured, basis)
+    else:
+        log.error("SerpAPI quota nearly exhausted (%d left) — SKIPPING news "
+                  "search this week. The procurement feeds (SAM.gov, "
+                  "CanadaBuys, AusTender, NZ GETS, TED) cost nothing and will "
+                  "still run, so the report is reduced but not missed.", left)
+        budget = 0
+
+    return budget
 
 
 # ==============================================================================
@@ -569,6 +688,9 @@ COUNTRY_REGION["Canada"] = "CANADA"
 COUNTRY_REGION["Mexico"] = "EMEA"   # no LATAM tab; Mexico is rare in this feed
 
 ALL_COUNTRIES = set(COUNTRY_REGION)
+
+# Case-insensitive index, so "JAPAN" / "japan" resolve as well as "Japan".
+_COUNTRY_REGION_LOWER = {c.lower(): r for c, r in COUNTRY_REGION.items()}
 
 # Names that are NOT safe to match bare, because they collide with a US state,
 # a US city, or an English word. Each needs corroborating evidence.
@@ -1610,7 +1732,14 @@ def classify_region(location: str) -> str:
     region = COUNTRY_REGION.get(base)
     if region:
         return region
+
+    # Case-insensitive retry. SAM.gov returns placeOfPerformance country names
+    # in UPPER CASE ("JAPAN"), which missed the exact-match lookup and sent two
+    # legitimate Japan rows to Needs Review in the 2026-08-10 run.
     low = base.lower()
+    region = _COUNTRY_REGION_LOWER.get(low)
+    if region:
+        return region
     if low in ("europe", "european union", "eu", "emea", "middle east",
                "africa", "asia", "asia pacific", "apac"):
         return "EMEA"
@@ -2040,7 +2169,12 @@ def parse_sam_result(opp: dict) -> dict | None:
     else:
         # Overseas MILCON — let the detector place it in the host country.
         detected = detect_location(f"{city} {state} {country} {desc[:800]}", title=title)
-        location = detected if detected != UNKNOWN else country
+        if detected != UNKNOWN:
+            location = detected
+        else:
+            # Title-case the raw SAM value ("JAPAN" -> "Japan") so it matches
+            # the canonical country names used for tab routing.
+            location = canonical_country(country)
 
     return {
         "Project Title": title,
@@ -2063,7 +2197,22 @@ def parse_sam_result(opp: dict) -> dict | None:
 #       instead of hard-coding names, so a schema change can't silently
 #       zero out the source again.
 
-CANADABUYS_CSV_URL = "https://canadabuys.canada.ca/opendata/pub/newTenderNotice-nouvelAvisAppelOffres.csv"
+# Use the OPEN tender notices file, not the "new" one.
+#
+# newTenderNotice-* is a ~1-DAY feed: it contains only notices published today
+# or yesterday, and refreshes every two hours. On a WEEKLY schedule that means
+# six of every seven days of Canadian procurement were never seen at all, which
+# is why the Canada tab came back empty.
+#
+# openTenderNotice-* is the snapshot of every tender currently accepting bids,
+# refreshed each morning. For a weekly report that is strictly better: it
+# catches anything still biddable regardless of posting date, and an open tender
+# is actionable in a way that a closed one from three weeks ago is not.
+# Cross-week dedupe on normalised URL stops the same notice being re-sent.
+CANADABUYS_CSV_URL = env(
+    "CANADABUYS_CSV_URL",
+    "https://canadabuys.canada.ca/opendata/pub/openTenderNotice-ouvertAvisAppelOffres.csv",
+)
 
 
 def _pick_column(fieldnames: list[str], *patterns: str) -> str:
@@ -2111,8 +2260,10 @@ def canadabuys_search(start_date: str) -> list[dict]:
                 continue
 
             pub = parse_any_date((rec.get(c_date) or "")[:19])
-            if pub and pub < start_date:
-                continue
+            # Deliberately NOT filtering on publication date here. This file
+            # lists tenders that are still OPEN, so the closing date is what
+            # matters, not when it was posted. Repeats across weeks are handled
+            # by history dedupe.
 
             ref = (rec.get(c_ref) or "").strip()
             url = (rec.get(c_url) or "").strip()
@@ -2331,6 +2482,16 @@ def ted_europa_search(start_date: str, end_date: str) -> list[dict]:
 
     log.info("TED Europa total -> %d results", len(results))
     return results
+
+
+def canonical_country(name: str) -> str:
+    """Map a country name in any case to its canonical spelling."""
+    if not name:
+        return UNKNOWN
+    for c in ALL_COUNTRIES:
+        if c.lower() == name.strip().lower():
+            return c
+    return name.strip().title()
 
 
 def _ted_text(value) -> str:
@@ -2781,7 +2942,7 @@ def send_report(xlsx: bytes, filename: str, subject: str, body: str) -> None:
 # MAIN
 # ==============================================================================
 
-def collect_rows() -> list[dict]:
+def collect_rows(search_budget: int | None = None) -> list[dict]:
     """Run every source and return the raw pooled rows."""
     news_start, news_end = date_range(LOOKBACK_DAYS)
     proc_start, proc_end = date_range(PROCUREMENT_LOOKBACK_DAYS)
@@ -2789,8 +2950,12 @@ def collect_rows() -> list[dict]:
 
     # 1. Google News
     week_iso = today().isocalendar()[1]
-    queries = queries_for_this_week(week_iso)
-    log.info("Running %d SerpAPI news searches (week %d rotation)", len(queries), week_iso)
+    queries = queries_for_this_week(week_iso, search_budget)
+    if not queries:
+        log.warning("No SerpAPI searches this run — skipping news collection.")
+    else:
+        log.info("Running %d SerpAPI news searches (week %d rotation)",
+                 len(queries), week_iso)
     for q in queries:
         for item in serpapi_news_search(q):
             row = parse_news_result(item)
@@ -2848,22 +3013,42 @@ def filter_rows(rows: list[dict]) -> list[dict]:
     return kept
 
 
+# How stale a row may be, per source.
+#
+# News must be recent to be news. But CanadaBuys and NZ GETS publish
+# CURRENTLY-OPEN opportunities, where the posting date says nothing about
+# whether the lead is live — a tender posted 90 days ago and closing next week
+# is one of the most actionable things in the report. Judging those on
+# publication date would silently discard the best Canadian and NZ leads.
+MAX_AGE_DAYS = {
+    "news":       LOOKBACK_DAYS,        # 10
+    "sam_gov":    SAM_LOOKBACK_DAYS,    # 30
+    "austender":  60,                   # awarded contracts
+    "ted_europa": 60,
+    "canadabuys": 240,                  # open-tender snapshot
+    "nz_gets":    240,                  # current-tender feed
+}
+
+
 def filter_dates(rows: list[dict]) -> list[dict]:
     """
-    Drop rows with no credible publish date, or one outside the window.
-    v1 had no date filter at all: 171 of 341 rows (50%) in the 8/3 report
-    predated its own 7-day lookback, some by nearly a year.
+    Drop rows with no credible publish date, or one outside that source's
+    window. v1 had no date filter at all: 171 of 341 rows (50%) in the 8/3
+    report predated its own 7-day lookback, some by nearly a year.
     """
     kept, dropped = [], 0
+    by_source: dict[str, int] = {}
     for row in rows:
         src = row.get("Source", "")
-        max_age = SAM_LOOKBACK_DAYS if src != "news" else LOOKBACK_DAYS
+        max_age = MAX_AGE_DAYS.get(src, SAM_LOOKBACK_DAYS)
         if date_is_sane(row.get("Date Published", ""), max_age):
             kept.append(row)
         else:
             dropped += 1
-    log.info("Date filter: kept %d, dropped %d (missing/stale/future dates)",
-             len(kept), dropped)
+            by_source[src] = by_source.get(src, 0) + 1
+    log.info("Date filter: kept %d, dropped %d (missing/stale/future dates)%s",
+             len(kept), dropped,
+             (" — by source: " + str(by_source)) if by_source else "")
     return kept
 
 
@@ -2899,8 +3084,12 @@ def main() -> None:
     starting_quota = check_serpapi_quota()
     log_quota_status("Start", starting_quota)
 
+    # Decide this run's search budget from the live quota. Free call, and it
+    # means nobody has to track the billing-cycle renewal date by hand.
+    search_budget = effective_search_budget(starting_quota, SEARCH_BUDGET_PER_RUN)
+
     # 1. Collect
-    raw = collect_rows()
+    raw = collect_rows(search_budget)
     log.info("Collected %d raw rows", len(raw))
 
     # 2. Dedupe within this run
